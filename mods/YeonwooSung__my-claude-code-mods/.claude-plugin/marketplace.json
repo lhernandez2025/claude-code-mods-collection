@@ -1,0 +1,96 @@
+{
+  "name": "my-claude-code-mods",
+  "owner": {
+    "name": "YeonwooSung"
+  },
+  "plugins": [
+    {
+      "name": "agent-profiler",
+      "source": "./agent-profiler",
+      "description": "Execution profiler for Claude Code: model wait vs tools vs subagents, live, with OTLP export"
+    },
+    {
+      "name": "context-inspector",
+      "source": "./context-inspector",
+      "description": "Context waste analyzer: what fills the window, re-reads, near-duplicate outputs, what compaction kept, advice"
+    },
+    {
+      "name": "time-machine",
+      "source": "./time-machine",
+      "description": "Agent Time Machine: a branching timeline of tool calls with shadow-git snapshots — inspect, diff, explain test failures, restore, branch, compare, re-run"
+    },
+    {
+      "name": "loop-detective",
+      "source": "./loop-detective",
+      "description": "Repeated-failure detective: evidence-backed Bash retry and edit/retry cases, live pane and investigation prompts"
+    },
+    {
+      "name": "pin-memo",
+      "source": "./pin-memo",
+      "description": "Persistent pinned memos and clickable todos above the prompt, isolated by folder and session"
+    },
+    {
+      "name": "model-effort-band",
+      "source": "./model-effort-band",
+      "description": "Shows the selected model and observed main-thread effort in a colored band above the prompt"
+    },
+    {
+      "name": "token-run",
+      "source": "./token-run",
+      "description": "Fully local ASCII runner for request failures and short breaks, with jump controls and a saved best score"
+    },
+    {
+      "name": "verify-board",
+      "source": "./verify-board",
+      "description": "Verify Board"
+    },
+    {
+      "name": "scope-guard",
+      "source": "./scope-guard",
+      "description": "Scope Guard"
+    },
+    {
+      "name": "blast-radius",
+      "source": "./blast-radius",
+      "description": "Blast Radius"
+    },
+    {
+      "name": "decision-ledger",
+      "source": "./decision-ledger",
+      "description": "Decision Ledger"
+    },
+    {
+      "name": "handoff-pack",
+      "source": "./handoff-pack",
+      "description": "Handoff Pack"
+    },
+    {
+      "name": "command-shelf",
+      "source": "./command-shelf",
+      "description": "Command Shelf"
+    },
+    {
+      "name": "env-doctor",
+      "source": "./env-doctor",
+      "description": "Env Doctor"
+    },
+    {
+      "name": "dependency-lens",
+      "source": "./dependency-lens",
+      "description": "Dependency Lens"
+    },
+    {
+      "name": "assumption-tracker",
+      "source": "./assumption-tracker",
+      "description": "Assumption Tracker"
+    },
+    {
+      "name": "review-queue",
+      "source": "./review-queue",
+      "description": "Review Queue"
+    }
+  ],
+  "metadata": {
+    "description": "Local Claude Code mods for developer profiling, context, verification and review workflows."
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "better-claude",
+  "version": "0.2.0",
+  "description": "Plugins and mods for Claude Code by midudev: After, Use Haiku, Think Hard, Token Meter, Sub Meter, Image Preview, Commit and Narrator.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Miguel Ángel Durán (midudev)",
+  "homepage": "https://github.com/midudev/better-claude#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/midudev/better-claude.git"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "claude-code-mod",
+    "queue",
+    "prompts",
+    "agents"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "npm run test:node && npm run test:mod",
+    "test:node": "node --test \"plugins/after/test/*.test.js\"",
+    "test:mod": "claude plugin test ./plugins/after && claude plugin test ./plugins/use-haiku && claude plugin test ./plugins/think-hard && claude plugin test ./plugins/token-meter && claude plugin test ./plugins/sub-meter && claude plugin test ./plugins/image-preview && claude plugin test ./plugins/narrator",
+    "test:watch": "node --test --watch \"plugins/after/test/*.test.js\"",
+    "typecheck": "npx -y -p typescript@7 tsc -p plugins/after",
+    "validate": "claude plugin validate . && claude plugin validate ./plugins/after && claude plugin validate ./plugins/use-haiku && claude plugin validate ./plugins/think-hard && claude plugin validate ./plugins/token-meter && claude plugin validate ./plugins/sub-meter && claude plugin validate ./plugins/image-preview && claude plugin validate ./plugins/commit && claude plugin validate ./plugins/narrator",
+    "eval": "node plugins/after/scripts/eval-haiku.js"
+  }
+}

@@ -1,0 +1,57 @@
+import { test, expect } from 'claude-code/testing'
+import { Feature } from '../hooks/core/feature.ts'
+const io = { cwd: '/repo', read: async () => '', run: async () => ({ exitCode: 0, stdout: ' M src/auth.ts\0', stderr: '' }), env: async () => undefined, revision: async () => 'a' }
+test('handoff preview combines goal, changed paths, remaining tasks and completed tasks after reload', async () => {
+  const f = new Feature()
+  await f.command('goal Fix login retry', io)
+  await f.command('todo Add regression test', io)
+  await f.command('todo Check timeout', io)
+  await f.command('done 1', io)
+  const text = await new Feature(f.data).command('', io)
+  for (const part of ['Fix login retry', 'src/auth.ts', '[x] #1 Add regression test', '[ ] #2 Check timeout']) expect(text).toContain(part)
+})
+test('observed failures and verification include evidence freshness and mask secrets', async () => {
+  const f = new Feature()
+  await f.observe({ tool: 'Bash', input: { command: 'npm test' }, result: { result: { exitCode: 1 }, text: 'API_TOKEN=private' }, before: 'a', after: 'a' }, io)
+  expect(await f.command('', io)).toContain('FAIL npm test')
+  expect(JSON.stringify(f.data)).not.toContain('private')
+  await f.observe({ tool: 'Bash', input: { command: 'npm test' }, result: { result: { exitCode: 0 } }, before: 'a', after: 'a' }, io)
+  expect(await f.command('', { ...io, revision: async () => 'b' })).toContain('STALE npm test')
+})
+test('denied operations do not become failed attempts; empty sessions and invalid todos are explicit', async () => {
+  const f = new Feature()
+  await f.observe({ tool: 'Bash', input: { command: 'private-command' }, result: { deny: 'no' } }, io)
+  expect(await f.command('', io)).not.toContain('private-command')
+  expect(await f.command('done 123', io)).toContain('not found')
+  expect(await f.command('export', io)).toContain('Usage')
+  expect(await f.command('', io)).toContain('(not set)')
+})
+test('missing Git evidence keeps useful notes but never preserves a current PASS', async () => {
+  const f = new Feature()
+  await f.command('goal Continue safely', io)
+  await f.observe({ tool: 'Bash', input: { command: 'npm test' }, result: { result: { exitCode: 0 } }, before: 'a', after: 'a' }, io)
+  const broken = { ...io, run: async () => ({ exitCode: 1, stdout: '', stderr: 'not a repo' }), revision: async () => undefined }
+  const report = await f.command('', broken)
+  expect(report).toContain('Continue safely')
+  expect(report).toContain('INCOMPLETE')
+  expect(report).toContain('UNKNOWN npm test')
+  expect(report).not.toContain('PASS npm test')
+})
+test('todo retention and completion preserve stable identities without affecting other todos', async () => {
+  const f = new Feature()
+  for (let i = 1; i <= 201; i++) await f.command(`todo task-${i}`, io)
+  expect(f.data.todos).toHaveLength(200)
+  expect(await f.command('done 1', io)).toContain('not found')
+  await f.command('done 201', io)
+  const report = await new Feature(f.data).command('', io)
+  expect(report).toContain('[x] #201 task-201')
+  expect(report).toContain('[ ] #200 task-200')
+})
+test('handoff does not present list-only Vitest invocations as completed verification', async () => {
+  const f = new Feature()
+  for (const command of ['vitest list', 'npx vitest list']) await f.observe({ tool: 'Bash', input: { command }, result: { result: { exitCode: 0 } }, before: 'a', after: 'a' }, io)
+  const report = await f.command('', io)
+  expect(report).not.toContain('PASS vitest')
+  expect(report).not.toContain('PASS npx vitest')
+  expect(f.data.checks).toHaveLength(0)
+})

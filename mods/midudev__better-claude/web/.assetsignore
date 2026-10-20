@@ -1,0 +1,8 @@
+# Kept out of the deploy: config, local skills and font sources
+wrangler.jsonc
+.wrangler
+.claude
+fonts/src
+fonts/subset.py
+.DS_Store
+narrator/record.swift

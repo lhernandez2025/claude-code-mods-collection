@@ -1,0 +1,401 @@
+import type { On, TurnStepResult, JsonValue } from 'claude-code'
+import { test, expect, type Engine } from 'claude-code/testing'
+
+const START = {cwd:'/repo',surface:'terminal' as const,isInteractive:true}
+const BAND = {hasSurvey:false,isWorking:false,maxRows:8,bodyColumns:64,scroll:{offset:0,bodyRows:8},view:{}}
+const PANE = {title:'Token Run',isFocused:true,bodyColumns:64,placement:'inline' as const,scroll:{offset:0,bodyRows:8},view:{}}
+const STEP = {turnId:'t1',index:0,model:'opus',messageCount:1}
+const usage = {input_tokens:1,output_tokens:2,cache_read_input_tokens:0,cache_creation_input_tokens:0,model:'opus'}
+const RESULT: TurnStepResult = {...STEP,answer:'ok',toolUses:[],stopReason:'end_turn',usage}
+function setup(on: On, options: {failRead?:boolean;failWrite?:boolean;failInvalidate?:boolean;failComplete?:()=>void;read?:()=>Promise<unknown>;open?:()=>Promise<void>} = {}) {
+  const saved = new Map<string,unknown>()
+  const opened: unknown[] = []
+  const names: string[] = []
+  const closed: string[] = []
+  on('session.start',(_$,e)=>({cwd:e.cwd}))
+  on('session.end',()=>({sessionId:'s'}))
+  on('command.register',(_$,e)=>{names.push(e.name);return {value:{command:e.name}}})
+  on('store.get',async(_$,e)=>{if(options.failRead) throw new Error('unreadable');return {value:options.read ? await options.read() : saved.get(e.key)}})
+  on('store.set',(_$,e)=>{if(options.failWrite) throw new Error('disk full');saved.set(e.key,e.value);return {value:undefined}})
+  on('ui.invalidate',()=>{if(options.failInvalidate) throw new Error('no UI');return {value:undefined}})
+  on('ui.open',async(_$,e)=>{opened.push(e);await options.open?.();return {value:{isPlaced:true}}})
+  on('ui.close',(_$,e)=>{closed.push(e.id);return {value:undefined}})
+  on('ui.render',async($,e)=>$.ui.resolve(e).Box({key:'other-mod',children:$.ui.resolve(e).Text({children:'other mod'})}))
+  on('turn.start',(_$,e)=>({turnId:e.turnId}))
+  on('turn.complete',()=>{options.failComplete?.();return {text:'original answer'}})
+  return {saved,opened,closed,names}
+}
+async function command($:Engine,args='') { return $.command.run({command:'token-run',args,origin:{kind:'composer'},presentation:{isFullscreen:false,columns:80}}) }
+async function complete($:Engine, reason:'error'|'answer'|'aborted'|'refusal'='error',agentId?:string,turnId='t1') {
+  const base={reason,agentId,turnId,answer:'unchanged',durationMs:10,isAborted:reason==='aborted'}
+  return $.turn.complete(reason==='refusal'?{...base,reason,refusal:{category:null,explanation:null}}:{...base,reason})
+}
+async function mount($:Engine,surface:'terminal'|'desktop'='terminal') {
+  return $.ui.mount({plugin:'token-run',surface,component:'Pane',requestId:'token-run',props:PANE,viewport:{columns:64,rows:8}})
+}
+
+test('registers local command, help does not open, and close targets only its Pane',async($,on)=>{
+  const env=setup(on)
+  await $.session.start(START)
+  expect(env.names).toContain('token-run')
+  expect((await command($,'help')).text).toContain('Space')
+  expect(env.opened).toHaveLength(0)
+  expect((await command($)).text).toContain('Token Run')
+  expect(env.opened).toHaveLength(1)
+  expect(env.opened[0]).toMatchObject({id:'token-run',focus:true,closeOnEscape:true})
+  await command($,'close');expect(env.closed).toContain('token-run')
+  expect((await command($,'nonsense')).text).toContain('help')
+})
+
+test('main request error invites without opening; click opens while preserving other mods',async($,on)=>{
+  const env=setup(on);await $.session.start(START)
+  await $.turn.start({turnId:'t1',text:'original prompt'})
+  expect(await complete($)).toEqual({text:'original answer'})
+  expect(env.opened).toHaveLength(0)
+  const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'AbovePrompt',props:BAND})
+  expect((await ui.find({key:'run-invite'}))?.text).toContain('요청 실패')
+  expect((await ui.find({key:'other-mod'}))?.text).toBe('other mod')
+  await ui.press({key:'run-invite'})
+  expect(env.opened).toHaveLength(1)
+  await ui.redraw({...BAND,hasSurvey:true})
+  expect(await ui.find({key:'run-invite'})).toBeUndefined()
+})
+
+test('aborted refused subagent and stale completions do not invite',async($,on)=>{
+  setup(on);await $.session.start(START)
+  await $.turn.start({turnId:'t1',text:'keep prompt'})
+  await complete($,'aborted');await complete($,'refusal');await complete($,'error','worker','a1')
+  await $.turn.start({turnId:'t2',text:'new'})
+  await complete($,'error',undefined,'t1')
+  const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'AbovePrompt',props:BAND})
+  expect(await ui.find({key:'run-invite'})).toBeUndefined()
+})
+
+test('stream chunks and generator result pass exactly once; response updates an open game',async($,on)=>{
+  setup(on);let calls=0
+  on('turn.step',async function*(){calls++;yield {kind:'text',index:0,text:'hello'};yield {kind:'stop',stopReason:'end_turn',usage};return RESULT})
+  await $.session.start(START);await $.turn.start({turnId:'t1',text:''});await complete($);await command($)
+  const ui=await mount($)
+  const stream=$.turn.step(STEP)
+  expect(await stream.next()).toEqual({done:false,value:{kind:'text',index:0,text:'hello'}})
+  expect(await stream.next()).toEqual({done:false,value:{kind:'stop',stopReason:'end_turn',usage}})
+  expect(await stream.next()).toEqual({done:true,value:RESULT})
+  expect(calls).toBe(1)
+  await ui.redraw()
+  expect((await ui.find({key:'run-status',in:'runner'}))?.text).toContain('응답이 돌아왔어요')
+})
+
+test('subagent stream cannot announce recovery and invalidate errors never retry downstream',async($,on)=>{
+  setup(on,{failInvalidate:true});let calls=0
+  on('turn.step',async function*(_$,e){calls++;yield {kind:'text',index:0,text:'one'};return {...RESULT,turnId:e.turnId}})
+  await $.session.start(START);await $.turn.start({turnId:'t1',text:''});await complete($);await command($)
+  for await(const _ of $.turn.step({...STEP,agentId:'worker',turnId:'a1'})) {}
+  const ui=await mount($)
+  expect((await ui.find({key:'run-status',in:'runner'}))?.text).not.toContain('응답이 돌아왔어요')
+  for await(const _ of $.turn.step(STEP)) {}
+  expect(calls).toBe(2)
+})
+
+for(const surface of ['terminal','desktop'] as const) {
+  test(`focused ${surface} Client starts jumps pauses restarts and posts records`,async($,on)=>{
+    const env=setup(on);await $.session.start({...START,surface});await command($)
+    const ui=await mount($,surface)
+    await ui.advance(1000)
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+    await ui.key({key:' '});await ui.advance(1000)
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+    expect(env.saved.get('token-run.best.v1')).toEqual({version:1,best:1})
+    await ui.key({key:'p'});await ui.advance(500)
+    expect((await ui.find({key:'run-phase',in:'runner'}))?.text).toContain('PAUSED')
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+    await ui.press({key:'run-pause'});await ui.advance(1000)
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 2')
+    await ui.key({key:'r'})
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+    expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('BEST 2')
+    await ui.press({key:'run-jump'});await ui.advance(50)
+    expect((await ui.find({key:'track-4',in:'runner'}))?.text).toContain('@')
+    await ui.key({key:'q'})
+    expect(env.closed).toContain('token-run')
+    await ui.unmount()
+  })
+}
+
+test('modified keys are ignored and repeated redraws do not multiply timers',async($,on)=>{
+  setup(on);await $.session.start(START);await command($);const ui=await mount($)
+  for(const event of [{key:' ',ctrl:true as const},{key:'up',meta:true as const},{key:' ',shift:true as const}]) await ui.key(event)
+  await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+  await ui.key({key:'up'})
+  for(let i=0;i<6;i++) await ui.redraw()
+  await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+})
+
+test('explicit pause and small region suspend physics',async($,on)=>{
+  setup(on);await $.session.start(START);await command($);const ui=await mount($)
+  await ui.key({key:' '});await ui.advance(1000)
+  await ui.key({key:'p'});await ui.advance(2000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  await ui.key({key:'p'});await ui.resize({columns:20,rows:8});await ui.advance(2000)
+  expect((await ui.find({key:'run-resize',in:'runner'}))?.text).toContain('Resize')
+  await ui.resize({columns:64,rows:8});await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 2')
+})
+
+test('collision freezes score and restart makes the game playable again',async($,on)=>{
+  setup(on);await $.session.start(START);await command($);const ui=await mount($)
+  await ui.key({key:' '});await ui.advance(7000)
+  expect((await ui.find({key:'run-phase',in:'runner'}))?.text).toContain('GAME OVER')
+  const score=(await ui.find({key:'run-score',in:'runner'}))?.text
+  await ui.advance(3000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toBe(score)
+  await ui.press({key:'run-restart'});await ui.press({key:'run-jump'});await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+})
+
+test('malformed messages and expired run ids cannot save or close the current game',async($,on)=>{
+  const env=setup(on);await $.session.start(START);await command($);const ui=await mount($)
+  const node=await ui.find({key:'runner'})
+  const props=node?.props?.props as {runId:number}
+  expect(props.runId).toBeGreaterThan(0)
+  for(const data of ([null,{}, {runId:props.runId,score:-1,type:'score'}, {runId:props.runId,score:1000000,type:'score'}, {runId:props.runId,score:'100',type:'score'}, {runId:props.runId,type:'unknown'}] as JsonValue[])) await ui.post(data)
+  expect(env.saved.size).toBe(0)
+  await command($,'close');await command($)
+  const before=env.closed.length
+  await ui.post({type:'exit',runId:props.runId,score:99})
+  expect(env.closed.length).toBe(before)
+  expect(env.saved.size).toBe(0)
+})
+
+test('session end removes the game and ignores subsequent old posts; saved best restores',async($,on)=>{
+  const env=setup(on);env.saved.set('token-run.best.v1',{version:1,best:30})
+  await $.session.start(START);await command($);const ui=await mount($)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('BEST 30')
+  const props=(await ui.find({key:'runner'}))?.props?.props as {runId:number}
+  await $.session.end({reason:'clear',sessionId:'s',resume:{id:'s'}})
+  expect(env.closed).toContain('token-run')
+  await ui.post({type:'score',runId:props.runId,score:900})
+  expect(env.saved.get('token-run.best.v1')).toEqual({version:1,best:30})
+  await ui.unmount();await $.session.start(START);await command($)
+  const next=await mount($)
+  expect((await next.find({key:'run-score',in:'runner'}))?.text).toContain('BEST 30')
+})
+
+test('storage failure warns without stopping frames; unsupported sessions explain the limitation',async($,on)=>{
+  setup(on,{failRead:true});await $.session.start(START);await command($);const ui=await mount($)
+  expect((await ui.find({key:'run-status',in:'runner'}))?.text).toContain('기록')
+  await ui.key({key:' '});await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  await $.session.start({...START,surface:null,isInteractive:false})
+  expect((await command($)).text).toContain('terminal')
+})
+
+test('downstream lifecycle errors propagate once and do not cause duplicate execution',async($,on)=>{
+  let calls=0;setup(on,{failComplete:()=>{calls++;throw new Error('downstream failed')}})
+  await $.session.start(START)
+  await expect(complete($)).rejects.toThrow()
+  expect(calls).toBe(1)
+})
+
+
+test('an opening delayed by storage cannot resurrect a game after session end',async($,on)=>{
+  let hold=false
+  let release!:(value:unknown)=>void
+  let began!:()=>void
+  const waiting=new Promise<unknown>(resolve=>{release=resolve})
+  const started=new Promise<void>(resolve=>{began=resolve})
+  const env=setup(on,{read:async()=>{if(hold){began();return waiting};return undefined}})
+  await $.session.start(START)
+  hold=true
+  const opening=command($)
+  await started
+  await $.session.end({reason:'clear',sessionId:'s',resume:{id:'s'}})
+  release(undefined)
+  await opening
+  expect(env.opened).toHaveLength(0)
+})
+
+test('a short Pane suspends physics despite a tall viewport',async($,on)=>{
+  setup(on);await $.session.start(START);await command($)
+  const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'Pane',requestId:'token-run',
+    props:{...PANE,scroll:{offset:0,bodyRows:7}},viewport:{columns:64,rows:20}})
+  expect((await ui.find({key:'run-resize',in:'runner'}))?.text).toContain('Resize')
+  await ui.key({key:' '});await ui.advance(2000)
+  await ui.redraw(PANE);await ui.resize({columns:64,rows:8})
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+})
+
+
+for(const mode of ['recovered','save-warning'] as const) {
+  test(`phase and retry remain visible beside ${mode} in a 24-column game`,async($,on)=>{
+    setup(on,{failWrite:mode==='save-warning'})
+    await $.session.start(START);await $.turn.start({turnId:'t1',text:''})
+    await complete($);await command($)
+    const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'Pane',requestId:'token-run',
+      props:{...PANE,bodyColumns:24},viewport:{columns:24,rows:8}})
+    await ui.key({key:' '});await ui.advance(7000)
+    if(mode==='recovered') await complete($,'answer')
+    await ui.redraw()
+    const raw=(await ui.find({key:'run-phase',in:'runner'}))?.text ?? ''
+    let cells=0,visible=''
+    for(const ch of raw) {const width=/[가-힣]/.test(ch)?2:1;if(cells+width>24)break;visible+=ch;cells+=width}
+    expect(visible).toContain('GAME OVER')
+    expect(visible).toContain('R')
+    expect(visible).toContain(mode==='recovered'?'BACK:Esc':'SAVE!')
+  })
+}
+
+test('Q closes promptly before a blocked best-score write finishes',async($,on)=>{
+  let hold=false
+  let release!:(value:unknown)=>void
+  let began!:()=>void
+  const blocked=new Promise<unknown>(resolve=>{release=resolve})
+  const started=new Promise<void>(resolve=>{began=resolve})
+  const env=setup(on,{read:async()=>{if(hold){began();return blocked};return undefined}})
+  await $.session.start(START);await command($);const ui=await mount($)
+  const before=env.closed.length
+  hold=true
+  const exiting=ui.key({key:'q'})
+  await started
+  await command($,'help')
+  const closedBeforeRelease=env.closed.length
+  release(undefined)
+  await exiting
+  expect(closedBeforeRelease).toBe(before+1)
+})
+
+test('a focused Client can jump and animate while the enclosing Pane is unfocused',async($,on)=>{
+  setup(on);await $.session.start(START);await command($)
+  // In the real terminal, focusing Client moves focus away from the Pane ring.
+  // ui.key represents a key already delivered to the focused Client by the engine.
+  const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'Pane',requestId:'token-run',
+    props:{...PANE,isFocused:false},viewport:{columns:64,rows:8}})
+  await ui.key({key:' '});await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  await ui.key({key:'p'});await ui.advance(1000)
+  expect((await ui.find({key:'run-phase',in:'runner'}))?.text).toContain('PAUSED')
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+})
+
+test('track clicks start and jump without double-jumping or treating modified/right clicks as input',async($,on)=>{
+  setup(on);await $.session.start(START);await command($)
+  const ui=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'Pane',requestId:'token-run',
+    props:{...PANE,isFocused:false},viewport:{columns:64,rows:8}})
+  await ui.pointer({type:'down',x:12,y:4,button:'right'})
+  await ui.pointer({type:'down',x:12,y:4,button:'left',ctrl:true})
+  await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+  await ui.pointer({type:'down',x:12,y:4,button:'left'})
+  await ui.pointer({type:'up',x:12,y:4,button:'left'})
+  await ui.advance(50)
+  expect((await ui.find({key:'track-4',in:'runner'}))?.text).toContain('@')
+  for(let n=0;n<20;n++) {
+    await ui.pointer({type:'down',x:12,y:4,button:'left'})
+    await ui.pointer({type:'up',x:12,y:4,button:'left'})
+  }
+  await ui.advance(950)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+})
+
+test('a late refused old Pane open cannot detach a newer game',async($,on)=>{
+  let blocked=true
+  let began!:()=>void
+  let refuse!:(error:Error)=>void
+  const started=new Promise<void>(resolve=>{began=resolve})
+  const pending=new Promise<void>((_resolve,reject)=>{refuse=reject})
+  setup(on,{open:async()=>{if(blocked){began();await pending}}})
+  await $.session.start(START)
+  const old=command($)
+  await started
+  await command($,'close')
+  blocked=false
+  await command($)
+  const ui=await mount($)
+  refuse(new Error('old opening refused'))
+  await old
+  await ui.redraw()
+  expect(await ui.find({key:'runner'})).toBeDefined()
+})
+
+test('a dock-to-inline Client remount restores the paused run and restart checkpoint',async($,on)=>{
+  setup(on);await $.session.start(START);await command($)
+  const ui=await mount($)
+  await ui.key({key:' '});await ui.advance(1000);await ui.key({key:'p'})
+  await ui.unmount()
+  const next=await $.ui.mount({plugin:'token-run',surface:'terminal',component:'Pane',requestId:'token-run',
+    props:{...PANE,bodyColumns:26,isFocused:false},viewport:{columns:26,rows:8}})
+  expect((await next.find({key:'run-phase',in:'runner'}))?.text).toContain('PAUSED')
+  expect((await next.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  await next.advance(2000)
+  expect((await next.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  await next.key({key:'r'});await next.unmount()
+  const reset=await mount($)
+  expect((await reset.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+  expect((await reset.find({key:'run-score',in:'runner'}))?.text).toContain('BEST 1')
+})
+
+test('a paused checkpoint remounts before its blocked score read finishes',async($,on)=>{
+  let hold=false
+  let release!:(value:unknown)=>void
+  let began!:()=>void
+  const blocked=new Promise<unknown>(resolve=>{release=resolve})
+  const started=new Promise<void>(resolve=>{began=resolve})
+  setup(on,{read:async()=>{if(hold){began();return blocked};return undefined}})
+  await $.session.start(START);await command($);const ui=await mount($)
+  await ui.key({key:' '});await ui.advance(1000)
+  hold=true
+  const pausing=ui.key({key:'p'})
+  await started
+  let restored
+  try {
+    await ui.unmount()
+    restored=await mount($)
+    expect((await restored.find({key:'run-phase',in:'runner'}))?.text).toContain('PAUSED')
+    await restored.advance(5000)
+    expect((await restored.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 1')
+  } finally { hold=false;release(undefined);await pausing }
+  await restored?.unmount()
+})
+
+test('repeated Client remounts retain one run and closing clears its checkpoint',async($,on)=>{
+  setup(on);await $.session.start(START);await command($)
+  let ui=await mount($)
+  await ui.key({key:' '});await ui.advance(1000)
+  for(let n=0;n<12;n++) {
+    await ui.unmount()
+    ui=await mount($)
+    await ui.redraw()
+  }
+  await ui.advance(1000)
+  expect((await ui.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 2')
+  await command($,'close');await ui.unmount();await command($)
+  const fresh=await mount($)
+  expect((await fresh.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+  expect((await fresh.find({key:'run-score',in:'runner'}))?.text).toContain('BEST 2')
+})
+
+test('invalid game checkpoints cannot save records or poison a remounted Client',async($,on)=>{
+  const env=setup(on);await $.session.start(START);await command($);const ui=await mount($)
+  const props=(await ui.find({key:'runner'}))?.props?.props as {runId:number}
+  const base={phase:'paused',ticks:40,y:0,vy:0,distance:24,nextSpawn:50,seed:1,initialSeed:1,obstacles:[]}
+  for(const game of [{...base,phase:['paused']},{...base,ticks:Infinity},{...base,obstacles:[{x:30,width:1,height:1,label:['BUG']}]},base]) {
+    // base is structurally valid but its two-second progress exceeds this posted score.
+    await ui.post({type:'score',runId:props.runId,score:1,game} as JsonValue)
+  }
+  expect(env.saved.size).toBe(0)
+  await ui.unmount();const fresh=await mount($)
+  expect((await fresh.find({key:'run-phase',in:'runner'}))?.text).toContain('CLICK + SPACE')
+  expect((await fresh.find({key:'run-score',in:'runner'}))?.text).toContain('SCORE 0')
+})
+
+test('cancelling a streamed turn runs downstream cleanup without consuming another chunk',async($,on)=>{
+  setup(on);let cleaned=0,afterYield=0
+  on('turn.step',async function*(){try {yield {kind:'text',index:0,text:'first'};afterYield++;yield {kind:'text',index:0,text:'second'};return RESULT} finally {cleaned++}})
+  await $.session.start(START);await $.turn.start({turnId:'t1',text:'original'})
+  const stream=$.turn.step(STEP)
+  expect(await stream.next()).toEqual({done:false,value:{kind:'text',index:0,text:'first'}})
+  await stream.return(undefined as never)
+  expect(cleaned).toBe(1)
+  expect(afterYield).toBe(0)
+})

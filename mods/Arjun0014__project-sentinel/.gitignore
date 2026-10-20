@@ -1,0 +1,22 @@
+node_modules/
+# Written by Claude Code each time it loads the mod; regenerated per build.
+plugins/project-sentinel/.claude-plugin/types/
+plugins/project-sentinel/tsconfig.json
+*.log
+.DS_Store
+Thumbs.db
+# Local development handoff notes (Context Autopilot writes them in whatever project it runs in).
+/NEXT_SESSION_PROMPT.md
+
+# Desktop preview output (tools/desktop-preview).
+tools/desktop-preview/out/
+
+# The scratch mod the tests run against (tools/test/mod.mjs).
+/.build/
+
+# Local secrets (API keys for tooling): never committed
+.env
+.env.*
+
+# The Kit benchmark's transpiled copy (tools/test/kitbench.mjs removes it when it ends)
+tools/test/kit.bench.mjs

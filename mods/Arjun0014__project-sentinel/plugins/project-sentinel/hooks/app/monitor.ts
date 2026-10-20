@@ -1,0 +1,266 @@
+/**
+ * The Resource Governor's live side: runs one sampler for the platform,
+ * evaluates pressure against the session's ceilings, and reports level
+ * changes. It never touches any process but its own sampler.
+ */
+
+import { LIMITS } from '../constants'
+import {
+  type Ceilings,
+  type Pressure,
+  UNKNOWN,
+  evaluate,
+} from '../features/resources/pressure'
+import {
+  type Platform,
+  type ProcStat,
+  type Sample,
+  cpuBetween,
+  cpuOfTopLine,
+  memoryOfLevel,
+  parseMeminfo,
+  parsePhysMem,
+  parseProcStat,
+  parseSysteminfoTotal,
+  parseTypeperfLine,
+  SAMPLER_EVERY_SEC,
+  platformOf,
+} from '../features/resources/sampler'
+import type { Host, SpawnStream } from '../host'
+
+export type MonitorStatus = 'off' | 'starting' | 'live' | 'unavailable'
+
+export class ResourceMonitor {
+  status: MonitorStatus = 'off'
+  platform: Platform = 'unknown'
+  samples: Sample[] = []
+  pressure: Pressure = UNKNOWN
+  error: string | null = null
+
+  private stream: SpawnStream | null = null
+  private timer: { cancel: () => void } | null = null
+  private lastProc: ProcStat | null = null
+  private generation = 0
+  private ceilings: Ceilings | null = null
+  /** Sampling for the status bar's live readings, with or without ceilings. */
+  private isWanted = false
+  private restarts = 0
+
+  constructor(
+    private readonly onSample: (pressure: Pressure, previous: Pressure) => void,
+    private readonly onStatus: () => void,
+  ) {}
+
+  async detectPlatform(host: Host, cwd: string): Promise<Platform> {
+    if (this.platform !== 'unknown') return this.platform
+    const isWindows = /^[A-Za-z]:[\\/]/.test(cwd) || cwd.startsWith('\\\\')
+    const hasProcStat = !isWindows && (await host.exists('/proc/stat').catch(() => false))
+    const hasMacSystem = !isWindows && !hasProcStat && (await host.exists('/System/Library/CoreServices/SystemVersion.plist').catch(() => false))
+    this.platform = platformOf({ cwd, hasProcStat, hasMacSystem })
+    return this.platform
+  }
+
+  /**
+   * Starts (or restarts) sampling: for these ceilings, or only for the live
+   * readings when `isWanted`; stops when neither asks for it.
+   */
+  async configure(host: Host, cwd: string, ceilings: Ceilings | null, intervalSec: number, isWanted = false): Promise<void> {
+    const wasRunning = this.status !== 'off'
+    const sameInterval = this.interval === intervalSec
+    this.ceilings = ceilings
+    this.isWanted = isWanted
+    if (ceilings === null && !isWanted) {
+      this.stop()
+      return
+    }
+    if (wasRunning && sameInterval && this.status !== 'unavailable') {
+      this.reevaluate(Date.now())
+      return
+    }
+    this.stop()
+    this.interval = intervalSec
+    this.restarts = 0
+    await this.start(host, cwd)
+  }
+
+  private interval = 5
+
+  private async start(host: Host, cwd: string): Promise<void> {
+    const generation = ++this.generation
+    this.status = 'starting'
+    this.error = null
+    this.onStatus()
+    const platform = await this.detectPlatform(host, cwd)
+    if (generation !== this.generation) return
+    if (platform === 'linux') {
+      this.timer = host.every(this.interval * 1000, () => void this.readProc(host, generation))
+      void this.readProc(host, generation)
+      return
+    }
+    if (platform === 'windows' || platform === 'macos') {
+      void this.consume(host, platform, generation, cwd)
+      return
+    }
+    this.fail('unsupported platform: monitoring needs Windows, macOS or Linux')
+  }
+
+  private async consume(host: Host, platform: 'windows' | 'macos', generation: number, cwd: string): Promise<void> {
+    let buffer = ''
+    // The sampler reports every SAMPLER_EVERY_SEC; a reading is taken at the interval the person set.
+    let takenAt = 0
+    const isDue = (at: number): boolean => at - takenAt >= this.interval * 1000 - SAMPLER_EVERY_SEC * 500
+    // macOS: memory in use from top's last PhysMem line, for when the kernel's level cannot be read.
+    let physUsed: number | null = null
+    // The first line that was not a reading (typeperf's "Error: No valid counters."), to say why it stopped.
+    let note = ''
+    try {
+      const stream = host.spawnSampler(platform)
+      this.stream = stream
+      // Windows: the machine's total memory, read once while typeperf takes its first sample.
+      const total = platform === 'windows' ? await this.totalMemory(host) : null
+      for await (const chunk of stream) {
+        if (generation !== this.generation) break
+        if (chunk.stream !== 'stdout') continue
+        buffer += chunk.text
+        let i: number
+        while ((i = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, i).replace(/\r$/, '')
+          buffer = buffer.slice(i + 1)
+          const at = Date.now()
+          if (platform === 'windows') {
+            const sample = parseTypeperfLine(line, at, total)
+            if (sample === null && note === '' && line.trim() !== '' && !line.startsWith('"')) note = line.trim()
+            if (sample !== null && isDue(at)) {
+              takenAt = at
+              this.push(sample)
+            }
+            continue
+          }
+          if (line.trimStart().startsWith('PhysMem:')) physUsed = parsePhysMem(line)
+          const cpu = cpuOfTopLine(line)
+          if (cpu === null || !isDue(at)) continue
+          takenAt = at
+          const ram = (await this.memoryLevel(host)) ?? physUsed
+          if (generation !== this.generation) break
+          this.push({ at, cpu, ram })
+        }
+        if (generation !== this.generation) break
+        if (buffer.length > 4096) buffer = buffer.slice(-1024)
+      }
+      if (generation === this.generation) this.fail(note === '' || /^exiting/i.test(note) ? 'the sampler exited' : `the sampler exited: ${note.slice(0, 120)}`)
+    } catch (error) {
+      if (generation === this.generation) this.fail(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (this.stream !== null && generation === this.generation) this.stream = null
+    }
+    if (generation === this.generation && this.restarts < 2) {
+      this.restarts += 1
+      this.timer = host.after(15_000, () => {
+        if (generation === this.generation && (this.ceilings !== null || this.isWanted)) void this.start(host, cwd)
+      })
+    }
+  }
+
+  /** Windows: the machine's total memory in bytes, from `systeminfo` once; null when it cannot be read (asked again at the next start). */
+  private total: Promise<number | null> | null = null
+
+  private async totalMemory(host: Host): Promise<number | null> {
+    this.total ??= host.systemInfo().then(
+      r => (r.exitCode === 0 ? parseSysteminfoTotal(r.stdout) : null),
+      () => null,
+    )
+    const total = await this.total
+    if (total === null) this.total = null
+    return total
+  }
+
+  /** macOS: memory in use by the kernel's level; null, and not asked again, once `sysctl` cannot give it (PhysMem stands in). */
+  private hasMemoryLevel = true
+
+  private async memoryLevel(host: Host): Promise<number | null> {
+    if (!this.hasMemoryLevel) return null
+    const r = await host.memoryLevel().catch(() => null)
+    const used = r !== null && r.exitCode === 0 ? memoryOfLevel(r.stdout) : null
+    if (used === null) this.hasMemoryLevel = false
+    return used
+  }
+
+  private async readProc(host: Host, generation: number): Promise<void> {
+    try {
+      const [stat, mem] = await Promise.all([host.readText('/proc/stat'), host.readText('/proc/meminfo')])
+      if (generation !== this.generation) return
+      const proc = parseProcStat(stat)
+      const cpu = proc !== null && this.lastProc !== null ? cpuBetween(this.lastProc, proc) : null
+      this.lastProc = proc
+      if (cpu === null && this.samples.length === 0) return
+      this.push({ at: Date.now(), cpu, ram: parseMeminfo(mem) })
+    } catch (error) {
+      if (generation === this.generation) this.fail(`cannot read /proc: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private push(sample: Sample): void {
+    this.samples.push(sample)
+    if (this.samples.length > 120) this.samples.splice(0, this.samples.length - 120)
+    if (this.status !== 'live') {
+      this.status = 'live'
+      this.error = null
+      this.onStatus()
+    }
+    this.reevaluate(sample.at)
+  }
+
+  reevaluate(now: number): void {
+    const previous = this.pressure
+    if (this.ceilings === null) {
+      // Readings only: no ceilings, no pressure; the live values still go out.
+      this.pressure = UNKNOWN
+      this.onSample(this.pressure, previous)
+      return
+    }
+    this.pressure = evaluate({
+      samples: this.samples,
+      ceilings: this.ceilings,
+      previous,
+      now,
+      windowMs: Math.max(15_000, this.interval * 3000),
+      staleMs: Math.max(LIMITS.sampleStaleMs, this.interval * 4000),
+    })
+    this.onSample(this.pressure, previous)
+  }
+
+  private fail(message: string): void {
+    this.status = 'unavailable'
+    this.error = message
+    this.pressure = UNKNOWN
+    this.onStatus()
+  }
+
+  stop(): void {
+    this.generation += 1
+    this.timer?.cancel()
+    this.timer = null
+    const stream = this.stream
+    this.stream = null
+    if (stream !== null) void stream.return(undefined as never).catch(() => undefined)
+    this.status = 'off'
+    this.pressure = UNKNOWN
+    this.error = null
+    this.lastProc = null
+    this.onStatus()
+  }
+
+  /** The newest reading, whether or not ceilings are set. */
+  latest(): { cpu: number | null; ram: number | null; at: number } | null {
+    const s = this.samples[this.samples.length - 1]
+    return s === undefined ? null : { cpu: s.cpu, ram: s.ram, at: s.at }
+  }
+
+  cpuSeries(n: number): number[] {
+    return this.samples.slice(-n).map(s => Math.round(s.cpu ?? 0))
+  }
+
+  ramSeries(n: number): number[] {
+    return this.samples.slice(-n).map(s => Math.round(s.ram ?? 0))
+  }
+}

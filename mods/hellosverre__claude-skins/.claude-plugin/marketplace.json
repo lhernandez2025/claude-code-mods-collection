@@ -1,0 +1,39 @@
+{
+  "name": "hellosverre-mods",
+  "description": "Mods for Claude Code: how it looks, and what it shows you.",
+  "owner": {
+    "name": "hellosverre",
+    "url": "https://github.com/hellosverre"
+  },
+  "plugins": [
+    {
+      "name": "skins",
+      "source": "./",
+      "description": "Skins for Claude Code: tool rows with icons, diff, table and Mermaid chart cards, a usage band and fifteen themes. /skin swaps them live."
+    },
+    {
+      "name": "redgreen",
+      "source": {
+        "source": "github",
+        "repo": "hellosverre/redgreen"
+      },
+      "description": "Test results in a pane: failures from Claude's vitest, jest, pytest, cargo, go, bun and deno runs, their detail and run history."
+    },
+    {
+      "name": "smart-compact",
+      "source": {
+        "source": "github",
+        "repo": "hellosverre/smart-compact"
+      },
+      "description": "Compacts at the right moment: after a commit or green tests, before the prompt cache expires, or when Claude asks for it."
+    },
+    {
+      "name": "mod-store",
+      "source": {
+        "source": "github",
+        "repo": "hellosverre/mod-store"
+      },
+      "description": "An app store for Claude Code mods in a pane: /mods to browse, search and install 2,700 community mods, with what each can access shown before you install."
+    }
+  ]
+}
