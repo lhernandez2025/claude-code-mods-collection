@@ -3,7 +3,7 @@
 Date: 2026-10-20. Scope: 11 public repos (plus Nate Herk's four mods, already reviewed).
 Method: shallow clone, then a static pattern scan (network calls, process execution, file writes, sensitive paths, obfuscation, install scripts, binaries) and a targeted read of every hit in the priority mods. **Nothing was executed or installed.** This is a static first pass, not a full audit: a clean scan is not proof of safety, and every mod should be re-read at the pinned commit before install.
 
-Environment context: DigitalOptometrics handles regulated (SaMD / HIPAA-adjacent) material, so "sends prompt text to a third party" is treated as disqualifying.
+Assessment lens: for use on machines that handle regulated or confidential data, "sends prompt text to a third party" is treated as disqualifying.
 
 ## Scan results
 
@@ -39,7 +39,7 @@ No committed secrets were found in any clone (AWS, GitHub, Anthropic, Slack, pri
 | secret-box | ray-amjad | **Recommended** | No network. Reads `.env`, writes `.env`/`.gitignore`, runs `git` only. Keeps secrets out of the transcript, refuses committing `.env`. |
 | transcript-redactor | ray-amjad | Recommended (alternative to secret-box) | No network, no writes. secret-box already includes it, run one or the other. |
 | flightdeck | scasella | **Recommended** | 6 code files, only `$.clock.now`. No network, no exec, no fs. Smallest and cleanest surface. |
-| dream-pass | ray-amjad | Conditional | Rewrites/deletes memory entries. Run once with the backup, review the diff; protect intentionally-kept entries (restored credentials in the Master KB note). |
+| dream-pass | ray-amjad | Conditional | Rewrites/deletes memory entries. Run once with the backup, review the diff; protect any entries you intentionally keep verbatim. |
 | project-sentinel | Arjun0014 | Conditional | Large (43k LOC), policy-heavy, read-only system commands. Overlaps Cache Keeper. Needs a proper read before install. |
 | ctx-handoff | cablate | Skip for now | Overlaps Cache Keeper handoff and keep-warm. Clean scan. |
 | effortless | HeyCubit | Skip | Egress to third-party hosts. |
